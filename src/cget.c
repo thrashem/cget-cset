@@ -12,19 +12,19 @@
 #include <string.h>
 
 void show_usage() {
-    printf("cget - Read text from clipboard and output to stdout\n");
-    printf("Copyright (c) 2025 thrashem\n\n");
-    printf("Usage:\n");
-    printf("  cget                 Read text from clipboard\n");
-    printf("  cget -h, --help, /?  Show this help\n\n");
-    printf("Examples:\n");
-    printf("  cget > output.txt    Save clipboard content to file\n");
-    printf("  cget | grep keyword  Search for keyword\n");
-    printf("  cget | findstr ABC   Search lines containing ABC\n\n");
-    printf("Exit codes:\n");
-    printf("  0  Success (text output)\n");
-    printf("  1  Cannot open clipboard\n");
-    printf("  2  No text data\n");
+    fprintf(stdout, "cget - Read text from clipboard and output to stdout\n");
+    fprintf(stdout, "Copyright (c) 2025 thrashem\n\n");
+    fprintf(stdout, "Usage:\n");
+    fprintf(stdout, "  cget                 Read text from clipboard\n");
+    fprintf(stdout, "  cget -h, --help, /?  Show this help\n\n");
+    fprintf(stdout, "Examples:\n");
+    fprintf(stdout, "  cget > output.txt    Save clipboard content to file\n");
+    fprintf(stdout, "  cget | grep keyword  Search for keyword\n");
+    fprintf(stdout, "  cget | findstr ABC   Search lines containing ABC\n\n");
+    fprintf(stdout, "Exit codes:\n");
+    fprintf(stdout, "  0  Success (text output)\n");
+    fprintf(stdout, "  1  Cannot open clipboard\n");
+    fprintf(stdout, "  2  No text data\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -37,12 +37,17 @@ int main(int argc, char* argv[]) {
             return 0;
         }
     }
+    
+    // UTF-8出力モードを明示的に設定
+    _setmode(_fileno(stdout), _O_U8TEXT);
+    
     // 現在のコンソールコードページを取得
     UINT consoleCP = GetConsoleOutputCP();
     
     // クリップボードを開く
     if (!OpenClipboard(NULL)) {
-        return 1; // エラー：クリップボードを開けない
+        fprintf(stderr, "Error: Cannot open clipboard\n");
+        return 1;
     }
 
     HANDLE hData = NULL;
@@ -54,22 +59,8 @@ int main(int argc, char* argv[]) {
         if (hData != NULL) {
             pszText = (wchar_t*)GlobalLock(hData);
             if (pszText != NULL) {
-                // コンソールのコードページに応じて出力方法を変更
-                if (consoleCP == 65001) { // UTF-8
-                    _setmode(_fileno(stdout), _O_U8TEXT);
-                    wprintf(L"%s", pszText);
-                } else { // SJIS等のマルチバイト
-                    // UTF-16からコンソールコードページに変換
-                    int mbLen = WideCharToMultiByte(consoleCP, 0, pszText, -1, NULL, 0, NULL, NULL);
-                    if (mbLen > 0) {
-                        char* mbText = (char*)malloc(mbLen);
-                        if (mbText != NULL) {
-                            WideCharToMultiByte(consoleCP, 0, pszText, -1, mbText, mbLen, NULL, NULL);
-                            printf("%s", mbText);
-                            free(mbText);
-                        }
-                    }
-                }
+                // UTF-8で出力
+                wprintf(L"%s", pszText);
                 GlobalUnlock(hData);
                 CloseClipboard();
                 return 0;
@@ -83,7 +74,8 @@ int main(int argc, char* argv[]) {
         if (hData != NULL) {
             char* pszAnsiText = (char*)GlobalLock(hData);
             if (pszAnsiText != NULL) {
-                printf("%s", pszAnsiText);
+                // マルチバイト文字列を適切に処理
+                fprintf(stdout, "%s", pszAnsiText);
                 GlobalUnlock(hData);
                 CloseClipboard();
                 return 0;
@@ -92,5 +84,6 @@ int main(int argc, char* argv[]) {
     }
 
     CloseClipboard();
-    return 2; // エラー：テキストデータがない
+    fprintf(stderr, "Error: No text data in clipboard\n");
+    return 2;
 }
