@@ -10,6 +10,7 @@
 #include <io.h>
 #include <fcntl.h>
 #include <string.h>
+#include <stdlib.h>
 
 void show_usage() {
     fprintf(stdout, "cget - Read text from clipboard and output to stdout\n");
@@ -38,11 +39,8 @@ int main(int argc, char* argv[]) {
         }
     }
     
-    // UTF-8出力モードを明示的に設定
-    _setmode(_fileno(stdout), _O_U8TEXT);
-    
-    // 現在のコンソールコードページを取得
-    UINT consoleCP = GetConsoleOutputCP();
+    // バイナリモードに設定（改行変換を防ぐ）
+    _setmode(_fileno(stdout), _O_BINARY);
     
     // クリップボードを開く
     if (!OpenClipboard(NULL)) {
@@ -59,8 +57,16 @@ int main(int argc, char* argv[]) {
         if (hData != NULL) {
             pszText = (wchar_t*)GlobalLock(hData);
             if (pszText != NULL) {
-                // UTF-8で出力
-                wprintf(L"%s", pszText);
+                // UTF-8に変換
+                int utf8_size = WideCharToMultiByte(CP_UTF8, 0, pszText, -1, NULL, 0, NULL, NULL);
+                if (utf8_size > 0) {
+                    char* utf8_text = (char*)malloc(utf8_size);
+                    if (utf8_text != NULL) {
+                        WideCharToMultiByte(CP_UTF8, 0, pszText, -1, utf8_text, utf8_size, NULL, NULL);
+                        fwrite(utf8_text, 1, strlen(utf8_text), stdout);
+                        free(utf8_text);
+                    }
+                }
                 GlobalUnlock(hData);
                 CloseClipboard();
                 return 0;
