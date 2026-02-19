@@ -1,6 +1,6 @@
 /*
  * cset - 標準入力からテキストを読み取りクリップボードに書き込み
- * 
+ *
  * Copyright (c) 2025 thrashem
  * Released under the MIT License
  */
@@ -8,13 +8,14 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <io.h>
 #include <fcntl.h>
-#include <string.h>
 
 #define CHUNK_SIZE 8192
+#define CP_SJIS    932
 
-void show_usage() {
+void show_usage(void) {
     printf("cset - Read text from stdin and write to clipboard\n");
     printf("Copyright (c) 2025 thrashem\n\n");
     printf("Usage:\n");
@@ -31,144 +32,161 @@ void show_usage() {
     printf("  2  No stdin input\n");
     printf("  3  Character conversion failed\n");
     printf("  4  Cannot open clipboard\n");
-    printf("  5-7 Clipboard operation failed\n");
+    printf("  5  Clipboard memory allocation failed\n");
+    printf("  6  Clipboard memory lock failed\n");
+    printf("  7  Clipboard set data failed\n");
+}
+
+/*
+ * 入力元がコンソール（TTY）かどうかを判定する。
+ *
+ * コンソール直接入力  → TRUE  : GetConsoleCP() のCPに従う（SJIS or UTF-8）
+ * パイプ・リダイレクト → FALSE : UTF-8として読む
+ *   - `echo text | cset` のようなパイプ
+ *   - `cset < file.txt` のようなリダイレクト
+ *   - Windows Terminal / VSCode 統合ターミナルもこちらになる場合がある
+ *     （その場合もUTF-8前提で動いているので問題ない）
+ */
+static BOOL is_console_input(void) {
+    return GetFileType(GetStdHandle(STD_INPUT_HANDLE)) == FILE_TYPE_CHAR;
+}
+
+/*
+ * GMEM_MOVEABLEブロックにデータを書き込むヘルパー。
+ * 成功時はハンドルを、失敗時はNULLを返す。
+ * SetClipboardData後はOSが所有権を持つため、
+ * 成功したハンドルをGlobalFreeしてはいけない。
+ */
+static HGLOBAL alloc_clipboard_mem(const void* data, SIZE_T size) {
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, size);
+    if (hMem == NULL) return NULL;
+    void* p = GlobalLock(hMem);
+    if (p == NULL) { GlobalFree(hMem); return NULL; }
+    memcpy(p, data, size);
+    GlobalUnlock(hMem);
+    return hMem;
 }
 
 int main(int argc, char* argv[]) {
-    // ヘルプオプションのチェック
     if (argc > 1) {
-        if (strcmp(argv[1], "-h") == 0 || 
-            strcmp(argv[1], "--help") == 0 || 
+        if (strcmp(argv[1], "-h") == 0 ||
+            strcmp(argv[1], "--help") == 0 ||
             strcmp(argv[1], "/?") == 0) {
             show_usage();
             return 0;
         }
     }
-    // 現在のコンソールコードページを取得
-    UINT consoleCP = GetConsoleCP();
-    
-    char* buffer = NULL;
-    size_t totalSize = 0;
+
+    /*
+     * 入力元に応じてコードページを決定する。
+     *
+     * コンソール直接  → GetConsoleCP() に従う
+     *   chcp 932   なら SJIS として読む
+     *   chcp 65001 なら UTF-8 として読む
+     *
+     * パイプ・リダイレクト → UTF-8 固定
+     *   `echo text | cset` は通常 UTF-8 で流れてくる。
+     *   `cget | cset` のパイプも cget が UTF-8 を出力するので整合する。
+     */
+    UINT inputCP = is_console_input() ? GetConsoleCP() : CP_UTF8;
+
+    /* バイナリモードで読む（改行変換を防ぐ） */
+    _setmode(_fileno(stdin), _O_BINARY);
+
+    /* --- 標準入力を全部読む --- */
+    char*  buffer         = NULL;
+    size_t totalSize      = 0;
     size_t bufferCapacity = CHUNK_SIZE;
-    
-    // 初期バッファを確保
+
     buffer = (char*)malloc(bufferCapacity);
-    if (buffer == NULL) {
-        return 1; // エラー：メモリ確保失敗
-    }
-    
-    // 標準入力から全データを読み取り
-    char tempBuffer[CHUNK_SIZE];
+    if (buffer == NULL) return 1;
+
+    char   tempBuffer[CHUNK_SIZE];
     size_t bytesRead;
-    
     while ((bytesRead = fread(tempBuffer, 1, CHUNK_SIZE, stdin)) > 0) {
-        // バッファサイズが足りない場合は拡張
-        if (totalSize + bytesRead >= bufferCapacity) {
+        if (totalSize + bytesRead + 1 >= bufferCapacity) {
             bufferCapacity = (totalSize + bytesRead + CHUNK_SIZE) * 2;
-            char* newBuffer = (char*)realloc(buffer, bufferCapacity);
-            if (newBuffer == NULL) {
-                free(buffer);
-                return 1; // エラー：メモリ確保失敗
-            }
-            buffer = newBuffer;
+            char* nb = (char*)realloc(buffer, bufferCapacity);
+            if (nb == NULL) { free(buffer); return 1; }
+            buffer = nb;
         }
-        
         memcpy(buffer + totalSize, tempBuffer, bytesRead);
         totalSize += bytesRead;
     }
-    
-    // 入力がない場合
-    if (totalSize == 0) {
-        free(buffer);
-        return 2; // エラー：入力なし
-    }
-    
-    buffer[totalSize] = '\0'; // null終端
 
-    // 入力文字コードからUTF-16に変換
-    wchar_t* wideBuffer = NULL;
-    int wideLen = 0;
-    
-    if (consoleCP == 65001) { // UTF-8入力
-        wideLen = MultiByteToWideChar(CP_UTF8, 0, buffer, -1, NULL, 0);
-    } else { // コンソールコードページ（SJIS等）入力
-        wideLen = MultiByteToWideChar(consoleCP, 0, buffer, -1, NULL, 0);
-    }
-    
-    if (wideLen <= 0) {
-        free(buffer);
-        return 3; // エラー：文字コード変換失敗
-    }
+    if (totalSize == 0) { free(buffer); return 2; }
+    buffer[totalSize] = '\0';
 
-    wideBuffer = (wchar_t*)malloc(wideLen * sizeof(wchar_t));
-    if (wideBuffer == NULL) {
-        free(buffer);
-        return 1; // エラー：メモリ確保失敗
-    }
+    /* --- 入力 → UTF-16LE --- */
+    int wideLen = MultiByteToWideChar(inputCP, 0, buffer, -1, NULL, 0);
+    if (wideLen <= 0) { free(buffer); return 3; }
 
-    if (consoleCP == 65001) { // UTF-8入力
-        MultiByteToWideChar(CP_UTF8, 0, buffer, -1, wideBuffer, wideLen);
-    } else { // コンソールコードページ入力
-        MultiByteToWideChar(consoleCP, 0, buffer, -1, wideBuffer, wideLen);
-    }
-    
+    wchar_t* wideBuffer = (wchar_t*)malloc(wideLen * sizeof(wchar_t));
+    if (wideBuffer == NULL) { free(buffer); return 1; }
+
+    MultiByteToWideChar(inputCP, 0, buffer, -1, wideBuffer, wideLen);
     free(buffer);
 
-    // クリップボードを開く
-    if (!OpenClipboard(NULL)) {
-        free(wideBuffer);
-        return 4; // エラー：クリップボードを開けない
-    }
-
-    // クリップボードをクリア
-    EmptyClipboard();
-
-    // Unicodeデータ用メモリを確保
-    HANDLE hMemUnicode = GlobalAlloc(GMEM_MOVEABLE, wideLen * sizeof(wchar_t));
-    if (hMemUnicode == NULL) {
-        CloseClipboard();
-        free(wideBuffer);
-        return 5; // エラー：メモリ確保失敗
-    }
-
-    // Unicodeデータをコピー
-    wchar_t* pMemUnicode = (wchar_t*)GlobalLock(hMemUnicode);
-    if (pMemUnicode == NULL) {
-        GlobalFree(hMemUnicode);
-        CloseClipboard();
-        free(wideBuffer);
-        return 6; // エラー：メモリロック失敗
-    }
-
-    memcpy(pMemUnicode, wideBuffer, wideLen * sizeof(wchar_t));
-    GlobalUnlock(hMemUnicode);
-
-    // ANSI版も作成（互換性のため）
-    int ansiLen = WideCharToMultiByte(CP_ACP, 0, wideBuffer, -1, NULL, 0, NULL, NULL);
-    HANDLE hMemAnsi = NULL;
-    
-    if (ansiLen > 0) {
-        hMemAnsi = GlobalAlloc(GMEM_MOVEABLE, ansiLen);
-        if (hMemAnsi != NULL) {
-            char* pMemAnsi = (char*)GlobalLock(hMemAnsi);
-            if (pMemAnsi != NULL) {
-                WideCharToMultiByte(CP_ACP, 0, wideBuffer, -1, pMemAnsi, ansiLen, NULL, NULL);
-                GlobalUnlock(hMemAnsi);
-                SetClipboardData(CF_TEXT, hMemAnsi);
-            }
+    /* --- UTF-16LE → SJIS ---
+     * CP_ACPではなくCP_SJIS(932)を明示する。
+     * CP_ACPはシステムロケール依存で、日本語環境以外では別CPになる。
+     */
+    int   sjisLen  = WideCharToMultiByte(CP_SJIS, 0, wideBuffer, -1, NULL, 0, NULL, NULL);
+    char* sjisBuffer = NULL;
+    if (sjisLen > 0) {
+        sjisBuffer = (char*)malloc(sjisLen);
+        if (sjisBuffer != NULL) {
+            WideCharToMultiByte(CP_SJIS, 0, wideBuffer, -1, sjisBuffer, sjisLen, NULL, NULL);
         }
     }
 
-    free(wideBuffer);
+    /* --- クリップボードへの書き込み ---
+     * OpenClipboard〜CloseClipboardの区間を最短にするため、
+     * 変換処理はすべてここより前に完了させている。
+     * この区間中は他プロセスがクリップボードにアクセスできない。
+     */
+    if (!OpenClipboard(NULL)) {
+        free(wideBuffer);
+        free(sjisBuffer);
+        return 4;
+    }
+    EmptyClipboard();
 
-    // クリップボードにUnicodeデータを設定
-    if (SetClipboardData(CF_UNICODETEXT, hMemUnicode) == NULL) {
-        GlobalFree(hMemUnicode);
-        if (hMemAnsi) GlobalFree(hMemAnsi);
+    /* CF_UNICODETEXT を先にセットする。
+     * Windowsはフォーマット登録順で優先度を判断するアプリが多いため、
+     * Unicodeを先に置くのが安全。
+     */
+    HGLOBAL hUnicode = alloc_clipboard_mem(wideBuffer, wideLen * sizeof(wchar_t));
+    free(wideBuffer);
+    wideBuffer = NULL;
+
+    if (hUnicode == NULL) {
+        free(sjisBuffer);
         CloseClipboard();
-        return 7; // エラー：データ設定失敗
+        return 5;
+    }
+    if (SetClipboardData(CF_UNICODETEXT, hUnicode) == NULL) {
+        GlobalFree(hUnicode); /* 所有権移転前なので解放OK */
+        free(sjisBuffer);
+        CloseClipboard();
+        return 7;
+    }
+    /* 所有権移転済み。以降 hUnicode を触らない */
+
+    /* CF_TEXT (SJIS) をセット。
+     * 失敗しても CF_UNICODETEXT は入っているので致命的ではない。
+     */
+    if (sjisBuffer != NULL) {
+        HGLOBAL hAnsi = alloc_clipboard_mem(sjisBuffer, sjisLen);
+        free(sjisBuffer);
+        if (hAnsi != NULL) {
+            if (SetClipboardData(CF_TEXT, hAnsi) == NULL) {
+                GlobalFree(hAnsi); /* 所有権移転前なので解放OK */
+            }
+            /* 成功時は所有権移転済み。触らない */
+        }
     }
 
     CloseClipboard();
-    return 0; // 成功
+    return 0;
 }
